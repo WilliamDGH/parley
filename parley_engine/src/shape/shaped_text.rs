@@ -272,6 +272,15 @@ impl ShapedText {
         &self.shaped_clusters
     }
 
+    /// The shaped clusters, mutably.
+    ///
+    /// This lets a layout engine adjust [`ShapedCluster::advance`] after shaping, e.g., to give a
+    /// tab the distance to its tab stop (see [`Whitespace::Tab`]).
+    #[inline(always)]
+    pub fn shaped_clusters_mut(&mut self) -> &mut [ShapedCluster] {
+        &mut self.shaped_clusters
+    }
+
     /// The shaped glyphs.
     ///
     /// [`ShapedRun::glyphs_range`] indexes into this.
