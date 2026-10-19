@@ -102,6 +102,9 @@ pub enum Whitespace {
     OtherSpaceSeparator = 4,
 
     /// Horizontal tab.
+    ///
+    /// Tabs shape to no glyphs, with the advance of a space in the run's font (see
+    /// [`ShapedRun::space_advance`](crate::ShapedRun::space_advance)).
     Tab = 5,
 
     /// Newline (CR, LF, CRLF, LS, or PS).
