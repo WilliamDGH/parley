@@ -14,10 +14,11 @@ use crate::inline_box::{LayoutInlineBox, inline_object_box_index};
 use crate::layout::data::{AlignedSubtreeOffset, run_box_metrics};
 use crate::layout::spacing::{EffectiveSpacing, Justification, is_word_separator};
 use crate::layout::style_metrics::{BoxMetrics, StyleMetrics, inline_box_placement};
+use crate::layout::tab::size_next_tab;
 use crate::layout::whitespace::atom_hanging_advance;
 use crate::layout::{
     BreakReason, Layout, LayoutData, LayoutItem, LayoutItemKind, LineData, LineItemData,
-    LineMetrics, Run,
+    LineMetrics,
 };
 use crate::style::Brush;
 use crate::{
@@ -76,11 +77,16 @@ struct LineState {
     /// being triggered on the cluster after the linebreak.
     text_wrap_mode: TextWrapMode,
 
-    /// The number of word separators appended to the line so far.
+    /// The number of word separators appended to the line since its last tab.
     ///
     /// These are the line's justification opportunities, before subtracting those that end up in
-    /// the line's hanging whitespace.
+    /// the line's hanging whitespace. Separators before a tab don't count: stretching them would
+    /// move the text after the tab off its tab stop.
     num_word_separators: u32,
+
+    /// One past the line's last tab cluster, or zero without one: where justification may start
+    /// (see [`Justification::justification_start_cluster`]).
+    justification_start_cluster: u32,
 }
 
 impl LineState {
@@ -89,6 +95,7 @@ impl LineState {
         self.x = 0.0;
         self.box_metrics.reset();
         self.num_word_separators = 0;
+        self.justification_start_cluster = 0;
     }
 }
 
@@ -767,7 +774,9 @@ impl BreakerState {
     /// `style_index` is the style of the atom's first character. The span boxes of the atom's
     /// styles (and those of their ancestors) are added to the line too, as is the box of the atom's
     /// run, see [`LineBoxMetrics::add_text`]. `is_word_separator` is `true` iff the atom is a
-    /// [word separator](`is_word_separator`), i.e., a justification opportunity.
+    /// [word separator](`is_word_separator`), i.e., a justification opportunity. `is_tab` is
+    /// `true` iff the atom is a tab, which restarts the count of justification opportunities so
+    /// that justification can't move it off its tab stop.
     #[inline]
     fn append_atom_to_line<B: Brush>(
         &mut self,
@@ -776,12 +785,18 @@ impl BreakerState {
         style_index: u16,
         data: &LayoutData<B>,
         is_word_separator: bool,
+        is_tab: bool,
     ) {
         self.line.items.end = self.item_idx + 1;
         self.line.clusters.end = atom.shaped_clusters_range().end;
         self.cluster_idx = atom.shaped_clusters_range().end;
         self.line.x = next_x;
-        self.line.num_word_separators += u32::from(is_word_separator);
+        if is_tab {
+            self.line.num_word_separators = 0;
+            self.line.justification_start_cluster = atom.shaped_clusters_range().end;
+        } else {
+            self.line.num_word_separators += u32::from(is_word_separator);
+        }
         self.line.box_metrics.add_text(
             self.item_idx,
             self.run_idx,
@@ -1137,16 +1152,21 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                 }
                 LayoutItemKind::TextRun => {
                     let run_idx = item.index;
-                    let run = Run::new(self.layout, 0, 0, run_idx, None);
-                    let slice = run.full_slice();
+                    let run_data = &self.layout.data.runs[run_idx];
+                    let shaped_run = &self.layout.data.shaped_text.runs()[run_idx];
+                    let cluster_end = shaped_run.shaped_clusters_range.end;
+                    let space_advance = shaped_run.space_advance;
+                    let has_tabs = shaped_run.has_tabs;
 
                     // Additional spacing to apply between atoms.
-                    let spacing = EffectiveSpacing::new(run.data.spacing, Justification::NONE);
+                    let run_spacing = run_data.spacing;
+                    let spacing = EffectiveSpacing::new(run_spacing, Justification::NONE);
 
                     // The height to report if the maximum line height is exceeded.
-                    let mut line_height = run.data.line_height;
+                    let mut line_height = run_data.line_height;
                     // An inline object is a run of its own. It exceeds the maximum line height by
                     // itself if its box is too tall.
+                    let slice = self.layout.data.shaped_text.run_slice(run_idx as u32);
                     if self.state.line_max_height != f32::MAX
                         && slice
                             .shaped_clusters()
@@ -1170,143 +1190,99 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         }
                     }
 
-                    // Iterate over the remaining atoms in the Run
-                    for atom in slice.atoms_from(self.state.cluster_idx) {
-                        // Retrieve metadata about the atom
-                        let first_character = &atom.characters()[0];
-                        let whitespace = first_character.whitespace;
-                        let is_newline = whitespace == Whitespace::Newline;
-                        // Whether this atom is a justification opportunity.
-                        let is_separator = is_word_separator(whitespace);
-                        let is_soft_wrap_opportunity =
-                            first_character.flags.is_soft_wrap_opportunity();
-                        let max_height_exceeded = self.state.line.max_height_exceeded;
-                        let style_index = first_character.style_index;
-                        let style = &self.layout.data.styles[style_index as usize];
+                    // Iterate over the remaining atoms in the Run, in segments that each end just
+                    // after a tab. A tab's advance depends on its position on the line, so it is
+                    // sized before its segment is entered; the segment itself is then walked with a
+                    // plain atom iterator, keeping mutable access to the shaped text out of the
+                    // loop below. Runs without tabs are a single segment.
+                    while self.state.cluster_idx < cluster_end {
+                        let segment_end = if has_tabs {
+                            size_next_tab(
+                                &mut self.layout.data.shaped_text,
+                                &self.layout.data.styles,
+                                run_idx as u32,
+                                self.state.cluster_idx,
+                                self.state.line.x + line_indent,
+                                space_advance,
+                                run_spacing,
+                            )
+                        } else {
+                            cluster_end
+                        };
+                        let slice = self
+                            .layout
+                            .data
+                            .shaped_text
+                            .run_slice(run_idx as u32)
+                            .narrow(self.state.cluster_idx..segment_end);
+                        for atom in slice.atoms_from(self.state.cluster_idx) {
+                            // Retrieve metadata about the atom
+                            let first_character = &atom.characters()[0];
+                            let whitespace = first_character.whitespace;
+                            let is_newline = whitespace == Whitespace::Newline;
+                            // Whether this atom is a justification opportunity.
+                            let is_separator = is_word_separator(whitespace);
+                            let is_tab = whitespace == Whitespace::Tab;
+                            let is_soft_wrap_opportunity =
+                                first_character.flags.is_soft_wrap_opportunity();
+                            let max_height_exceeded = self.state.line.max_height_exceeded;
+                            let style_index = first_character.style_index;
+                            let style = &self.layout.data.styles[style_index as usize];
 
-                        // Lag text_wrap_mode style by one atom
-                        let text_wrap_mode = self.state.line.text_wrap_mode;
-                        self.state.line.text_wrap_mode = style.text_wrap_mode;
+                            // Lag text_wrap_mode style by one atom
+                            let text_wrap_mode = self.state.line.text_wrap_mode;
+                            self.state.line.text_wrap_mode = style.text_wrap_mode;
 
-                        // Take mandatory line breaks before checking for line wrapping.
-                        if is_newline {
-                            if max_height_exceeded {
-                                return self.max_height_break_data(line_height);
-                            }
+                            // Take mandatory line breaks before checking for line wrapping.
+                            if is_newline {
+                                if max_height_exceeded {
+                                    return self.max_height_break_data(line_height);
+                                }
 
-                            self.state.append_atom_to_line(
-                                &atom,
-                                self.state.line.x,
-                                style_index,
-                                &self.layout.data,
-                                is_separator,
-                            );
+                                self.state.append_atom_to_line(
+                                    &atom,
+                                    self.state.line.x,
+                                    style_index,
+                                    &self.layout.data,
+                                    is_separator,
+                                    is_tab,
+                                );
 
-                            return self.start_new_line(
-                                BreakReason::Explicit,
-                                max_advance,
-                                line_indent,
-                            );
-                        } else if is_soft_wrap_opportunity && text_wrap_mode == TextWrapMode::Wrap {
-                            // We don't record boundaries when the advance is 0. As we do not want overflowing content to cause extra consecutive
-                            // line breaks. We should accept the overflowing fragment in that scenario.
-                            if self.state.line.x != 0.0 {
-                                self.state.mark_line_break_opportunity();
-                                // break_opportunity = true;
-                            }
-                        } else if
-                        // This text can contribute "emergency" line breaks.
-                        style.overflow_wrap != OverflowWrap::Normal
+                                return self.start_new_line(
+                                    BreakReason::Explicit,
+                                    max_advance,
+                                    line_indent,
+                                );
+                            } else if is_soft_wrap_opportunity
+                                && text_wrap_mode == TextWrapMode::Wrap
+                            {
+                                // We don't record boundaries when the advance is 0. As we do not want overflowing content to cause extra consecutive
+                                // line breaks. We should accept the overflowing fragment in that scenario.
+                                if self.state.line.x != 0.0 {
+                                    self.state.mark_line_break_opportunity();
+                                    // break_opportunity = true;
+                                }
+                            } else if
+                            // This text can contribute "emergency" line breaks.
+                            style.overflow_wrap != OverflowWrap::Normal
                         && text_wrap_mode == TextWrapMode::Wrap
                         // If we're at the start of the line, this particular atom will never fit, so it's not a valid emergency break opportunity.
                         && self.state.line.x != 0.0
-                        {
-                            self.state.mark_emergency_break_opportunity();
-                        }
-
-                        // Breaking an atom requires reshaping, which we don't do here, so it is
-                        // consumed as a whole (this includes all clusters of a ligature).
-                        let advance = spacing.atom_advance(&atom);
-
-                        // Compute the x position of the content being currently processed
-                        let next_x = self.state.line.x + advance;
-
-                        // If the content fits (the x position does NOT exceed max_advance)
-                        //
-                        // We simply append the atom to the current line
-                        if next_x <= max_advance {
-                            if max_height_exceeded {
-                                return self.max_height_break_data(line_height);
-                            }
-                            self.state.append_atom_to_line(
-                                &atom,
-                                next_x,
-                                style_index,
-                                &self.layout.data,
-                                is_separator,
-                            );
-                        }
-                        // Else we attempt to line break:
-                        //
-                        // This will only succeed if there is an available line-break opportunity that has been marked earlier
-                        // in the line. If there is no such line-breaking opportunity (such as if wrapping is disabled), then
-                        // we fall back to appending the content to the line anyway.
-                        else {
-                            // Case: the atom fits once its hanging whitespace is excluded.
-                            //
-                            // We append it to the line, with the whitespace hanging past the end.
-                            let (hanging, all_hang) = atom_hanging_advance(
-                                slice,
-                                &atom,
-                                &self.layout.data.styles,
-                                spacing,
-                                item.bidi_level.is_rtl(),
-                            );
-                            if all_hang || next_x - hanging <= max_advance {
-                                if max_height_exceeded {
-                                    return self.max_height_break_data(line_height);
-                                }
-                                self.state.append_atom_to_line(
-                                    &atom,
-                                    next_x,
-                                    style_index,
-                                    &self.layout.data,
-                                    is_separator,
-                                );
-                            }
-                            // Case: we have previously encountered a REGULAR line-breaking opportunity in the current line
-                            //
-                            // We "take" the line-breaking opportunity by starting a new line and resetting our
-                            // item/run/cluster iteration state back to how it was when the line-breaking opportunity was encountered
-                            else if let Some(prev) = self.state.prev_boundary.take() {
-                                self.state.reset_to(prev);
-                                return self.start_new_line(
-                                    BreakReason::Regular,
-                                    max_advance,
-                                    line_indent,
-                                );
-                            }
-                            // Case: we have previously encountered an EMERGENCY line-breaking opportunity in the current line
-                            //
-                            // We "take" the line-breaking opportunity by starting a new line and resetting our
-                            // item/run/cluster iteration state back to how it was when the line-breaking opportunity was encountered
-                            else if let Some(prev_emergency) =
-                                self.state.emergency_boundary.take()
                             {
-                                self.state.reset_to(prev_emergency);
-                                return self.start_new_line(
-                                    BreakReason::Emergency,
-                                    max_advance,
-                                    line_indent,
-                                );
+                                self.state.mark_emergency_break_opportunity();
                             }
-                            // Case: no line-breaking opportunities available
+
+                            // Breaking an atom requires reshaping, which we don't do here, so it is
+                            // consumed as a whole (this includes all clusters of a ligature).
+                            let advance = spacing.atom_advance(&atom);
+
+                            // Compute the x position of the content being currently processed
+                            let next_x = self.state.line.x + advance;
+
+                            // If the content fits (the x position does NOT exceed max_advance)
                             //
-                            // This can happen when wrapping is disabled (TextWrapMode::NoWrap) or when no wrapping opportunities
-                            // (according to our `OverflowWrap` and `WordBreak` styles) have yet been encountered.
-                            //
-                            // We fall back to appending the content to the line.
-                            else {
+                            // We simply append the atom to the current line
+                            if next_x <= max_advance {
                                 if max_height_exceeded {
                                     return self.max_height_break_data(line_height);
                                 }
@@ -1316,7 +1292,83 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                     style_index,
                                     &self.layout.data,
                                     is_separator,
+                                    is_tab,
                                 );
+                            }
+                            // Else we attempt to line break:
+                            //
+                            // This will only succeed if there is an available line-break opportunity that has been marked earlier
+                            // in the line. If there is no such line-breaking opportunity (such as if wrapping is disabled), then
+                            // we fall back to appending the content to the line anyway.
+                            else {
+                                // Case: the atom fits once its hanging whitespace is excluded.
+                                //
+                                // We append it to the line, with the whitespace hanging past the end.
+                                let (hanging, all_hang) = atom_hanging_advance(
+                                    slice,
+                                    &atom,
+                                    &self.layout.data.styles,
+                                    spacing,
+                                    item.bidi_level.is_rtl(),
+                                );
+                                if all_hang || next_x - hanging <= max_advance {
+                                    if max_height_exceeded {
+                                        return self.max_height_break_data(line_height);
+                                    }
+                                    self.state.append_atom_to_line(
+                                        &atom,
+                                        next_x,
+                                        style_index,
+                                        &self.layout.data,
+                                        is_separator,
+                                        is_tab,
+                                    );
+                                }
+                                // Case: we have previously encountered a REGULAR line-breaking opportunity in the current line
+                                //
+                                // We "take" the line-breaking opportunity by starting a new line and resetting our
+                                // item/run/cluster iteration state back to how it was when the line-breaking opportunity was encountered
+                                else if let Some(prev) = self.state.prev_boundary.take() {
+                                    self.state.reset_to(prev);
+                                    return self.start_new_line(
+                                        BreakReason::Regular,
+                                        max_advance,
+                                        line_indent,
+                                    );
+                                }
+                                // Case: we have previously encountered an EMERGENCY line-breaking opportunity in the current line
+                                //
+                                // We "take" the line-breaking opportunity by starting a new line and resetting our
+                                // item/run/cluster iteration state back to how it was when the line-breaking opportunity was encountered
+                                else if let Some(prev_emergency) =
+                                    self.state.emergency_boundary.take()
+                                {
+                                    self.state.reset_to(prev_emergency);
+                                    return self.start_new_line(
+                                        BreakReason::Emergency,
+                                        max_advance,
+                                        line_indent,
+                                    );
+                                }
+                                // Case: no line-breaking opportunities available
+                                //
+                                // This can happen when wrapping is disabled (TextWrapMode::NoWrap) or when no wrapping opportunities
+                                // (according to our `OverflowWrap` and `WordBreak` styles) have yet been encountered.
+                                //
+                                // We fall back to appending the content to the line.
+                                else {
+                                    if max_height_exceeded {
+                                        return self.max_height_break_data(line_height);
+                                    }
+                                    self.state.append_atom_to_line(
+                                        &atom,
+                                        next_x,
+                                        style_index,
+                                        &self.layout.data,
+                                        is_separator,
+                                        is_tab,
+                                    );
+                                }
                             }
                         }
                     }
@@ -1371,62 +1423,88 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                 LayoutItemKind::TextRun => {
                     let run_idx = item.index;
                     let shaped_run = &self.layout.data.shaped_text.runs()[run_idx];
-                    let run = Run::new(self.layout, 0, 0, run_idx, None);
-                    let slice = run.full_slice();
-                    let spacing = run.line_spacing();
                     let cluster_end = shaped_run.shaped_clusters_range.end;
+                    let space_advance = shaped_run.space_advance;
+                    let has_tabs = shaped_run.has_tabs;
+                    let run_spacing = self.layout.data.runs[run_idx].spacing;
+                    let spacing = EffectiveSpacing::new(run_spacing, Justification::NONE);
 
-                    for atom in slice.atoms_from(self.state.cluster_idx) {
-                        // Check if we should break before this atom
-                        if char_count >= max_chars && max_chars != 0 {
-                            self.start_new_line(BreakReason::Regular, f32::MAX, line_indent);
-                            return Some(());
-                        }
-
-                        let first_character = &atom.characters()[0];
-                        let whitespace = first_character.whitespace;
-                        let is_newline = whitespace == Whitespace::Newline;
-                        let is_separator = is_word_separator(whitespace);
-                        let advance = spacing.atom_advance(&atom);
-
-                        // Compute the x position.
-                        // Newlines don't contribute to line width (matching break_next behavior).
-                        let next_x = if is_newline {
-                            self.state.line.x
+                    // Iterate in segments ending after each tab, sizing the tab first (see
+                    // `break_next`).
+                    while self.state.cluster_idx < cluster_end {
+                        let segment_end = if has_tabs {
+                            size_next_tab(
+                                &mut self.layout.data.shaped_text,
+                                &self.layout.data.styles,
+                                run_idx as u32,
+                                self.state.cluster_idx,
+                                self.state.line.x + line_indent,
+                                space_advance,
+                                run_spacing,
+                            )
                         } else {
-                            self.state.line.x + advance
+                            cluster_end
                         };
-                        self.state.append_atom_to_line(
-                            &atom,
-                            next_x,
-                            first_character.style_index,
-                            &self.layout.data,
-                            is_separator,
-                        );
-                        char_count += atom.char_range().len() as u32;
-
-                        // Check if we've reached the limit after adding this atom
-                        if char_count >= max_chars {
-                            // Determine the break reason:
-                            // - BreakReason::None for the last line (end of content)
-                            // - BreakReason::Explicit if this line ends with a newline
-                            // - BreakReason::Regular for soft wraps
-                            let is_last_cluster_of_run = self.state.cluster_idx >= cluster_end;
-                            let is_last_item =
-                                self.state.item_idx + 1 >= self.layout.data.items.len();
-                            let break_reason = if is_last_cluster_of_run && is_last_item {
-                                BreakReason::None
-                            } else if is_newline {
-                                BreakReason::Explicit
-                            } else {
-                                BreakReason::Regular
-                            };
-
-                            if break_reason == BreakReason::None {
-                                self.done = true;
+                        let slice = self
+                            .layout
+                            .data
+                            .shaped_text
+                            .run_slice(run_idx as u32)
+                            .narrow(self.state.cluster_idx..segment_end);
+                        for atom in slice.atoms_from(self.state.cluster_idx) {
+                            // Check if we should break before this atom
+                            if char_count >= max_chars && max_chars != 0 {
+                                self.start_new_line(BreakReason::Regular, f32::MAX, line_indent);
+                                return Some(());
                             }
-                            self.start_new_line(break_reason, f32::MAX, line_indent);
-                            return Some(());
+
+                            let first_character = &atom.characters()[0];
+                            let whitespace = first_character.whitespace;
+                            let is_newline = whitespace == Whitespace::Newline;
+                            let is_separator = is_word_separator(whitespace);
+                            let is_tab = whitespace == Whitespace::Tab;
+                            let advance = spacing.atom_advance(&atom);
+
+                            // Compute the x position.
+                            // Newlines don't contribute to line width (matching break_next behavior).
+                            let next_x = if is_newline {
+                                self.state.line.x
+                            } else {
+                                self.state.line.x + advance
+                            };
+                            self.state.append_atom_to_line(
+                                &atom,
+                                next_x,
+                                first_character.style_index,
+                                &self.layout.data,
+                                is_separator,
+                                is_tab,
+                            );
+                            char_count += atom.char_range().len() as u32;
+
+                            // Check if we've reached the limit after adding this atom
+                            if char_count >= max_chars {
+                                // Determine the break reason:
+                                // - BreakReason::None for the last line (end of content)
+                                // - BreakReason::Explicit if this line ends with a newline
+                                // - BreakReason::Regular for soft wraps
+                                let is_last_cluster_of_run = self.state.cluster_idx >= cluster_end;
+                                let is_last_item =
+                                    self.state.item_idx + 1 >= self.layout.data.items.len();
+                                let break_reason = if is_last_cluster_of_run && is_last_item {
+                                    BreakReason::None
+                                } else if is_newline {
+                                    BreakReason::Explicit
+                                } else {
+                                    BreakReason::Regular
+                                };
+
+                                if break_reason == BreakReason::None {
+                                    self.done = true;
+                                }
+                                self.start_new_line(break_reason, f32::MAX, line_indent);
+                                return Some(());
+                            }
                         }
                     }
                     self.state.run_idx += 1;
@@ -1810,6 +1888,7 @@ fn commit_line<B: Brush>(
         layout,
         &lines.line_items[start_item_idx..end_item_idx],
         overflow,
+        state.justification_start_cluster,
     );
     // The word separators counted as the line was built include the line's hanging whitespace, and
     // hanging whitespace is not stretched by justification.
@@ -1828,6 +1907,7 @@ fn commit_line<B: Brush>(
         break_reason,
         num_justification_opportunities,
         justification: Justification {
+            justification_start_cluster: state.justification_start_cluster,
             justification_end_cluster,
             ..Justification::NONE
         },
@@ -1883,6 +1963,7 @@ fn hanging_whitespace<B: Brush>(
     layout: &Layout<B>,
     line_items: &[LineItemData],
     overflow: f32,
+    justification_start_cluster: u32,
 ) -> (f32, u32, u32) {
     let mut hanging_whitespace_advance = 0.;
     // Atoms with shaped clusters before this index may be stretched by justification.
@@ -1957,7 +2038,11 @@ fn hanging_whitespace<B: Brush>(
                     // Justification can't stretch within an atom, so it stops at the start of the
                     // last atom that hangs in its entirety or only partially.
                     justification_end_cluster = atom.shaped_clusters_range().start;
-                    if is_word_separator(whitespace) {
+                    // Only opportunities that were counted can be subtracted: those before the
+                    // line's last tab never were.
+                    if is_word_separator(whitespace)
+                        && atom.shaped_clusters_range().start >= justification_start_cluster
+                    {
                         hanging_opportunities += 1;
                     }
                     if !all_hang {
