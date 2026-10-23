@@ -72,14 +72,20 @@ pub(crate) fn size_tab<B: Brush>(
     );
 }
 
-/// Sizes the next tab of run `run_idx` at or after `cluster_idx`, if any, and returns the cluster
-/// index just past that tab's atom, or the run's end if there is none.
+/// Sizes the next tab of run `run_idx` at or after `cluster_idx`, if it is within reach, and
+/// returns the cluster index up to which the breaker can now proceed: just past that tab's atom,
+/// or the run's end if there is none.
 ///
 /// The tab is sized as if the line breaker places every atom before it on the current line, from
 /// `x`, the line's current advance including its indent. Should a line break fall before the tab
 /// after all, the breaker returns and the next call sizes it again from its new position. The
 /// scan runs through newlines, which have no advance: `break_next` returns at a newline and
 /// re-sizes the tab on re-entry, while `break_next_with_length` keeps the line going past it.
+///
+/// The scan looks at most [`MAX_SCAN_ATOMS`] atoms ahead. Past that, it returns where it stopped
+/// without sizing anything, and the breaker calls again once it has consumed those atoms. Without
+/// the cap, a tab far into a run would be scanned towards again on every line before it, making
+/// line breaking quadratic in the number of lines.
 pub(crate) fn size_next_tab<B: Brush>(
     shaped_text: &mut ShapedText,
     styles: &[Style<B>],
@@ -91,18 +97,20 @@ pub(crate) fn size_next_tab<B: Brush>(
 ) -> u32 {
     let effective_spacing = EffectiveSpacing::new(spacing, Justification::NONE);
     let slice = shaped_text.run_slice(run_idx);
-    let cluster_end = slice.shaped_clusters_range().end;
 
     let mut x = x;
+    let mut scanned_to = slice.shaped_clusters_range().end;
     let mut tab = None;
-    for atom in slice.atoms_from(cluster_idx) {
+    for (count, atom) in slice.atoms_from(cluster_idx).enumerate() {
         let clusters = atom.shaped_clusters_range();
-        match atom.shaped_clusters()[0].whitespace() {
-            Whitespace::Tab => {
-                tab = Some(clusters);
-                break;
-            }
-            _ => x += effective_spacing.atom_advance(&atom),
+        if atom.shaped_clusters()[0].whitespace() == Whitespace::Tab {
+            tab = Some(clusters);
+            break;
+        }
+        x += effective_spacing.atom_advance(&atom);
+        if count + 1 == MAX_SCAN_ATOMS {
+            scanned_to = clusters.end;
+            break;
         }
     }
 
@@ -118,9 +126,12 @@ pub(crate) fn size_next_tab<B: Brush>(
             );
             clusters.end
         }
-        None => cluster_end,
+        None => scanned_to,
     }
 }
+
+/// The most atoms [`size_next_tab`] scans ahead before handing back to the breaker.
+const MAX_SCAN_ATOMS: usize = 64;
 
 #[cfg(test)]
 mod tests {
