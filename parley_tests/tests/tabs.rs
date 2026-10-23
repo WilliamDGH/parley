@@ -3,9 +3,9 @@
 
 //! Tab stop tests.
 //!
-//! Tabs shift the following glyph to the next tab stop, following CSS Text 4 § 4.1.3. The tests
-//! measure the shift against the advance of the space character, as [`TabSize::Spaces`] is a
-//! multiple of it.
+//! Tabs shift the following glyph to the next tab stop, following CSS Text 4 (`#tab-stop`). The
+//! tests measure the shift against the advance of the space character, as [`TabSize::Spaces`] is
+//! a multiple of it.
 
 use crate::test_name;
 use crate::util::{ColorBrush, TestEnv};
@@ -159,7 +159,7 @@ fn tab_consecutive_tabs_each_advance_a_stop() {
 }
 
 #[test]
-fn tab_size_zero_renders_nothing() {
+fn tab_size_zero_removes_the_tabs_advance() {
     let mut env = TestEnv::new(test_name!(), None);
     let a = advance(&mut env, "a");
 
@@ -167,6 +167,16 @@ fn tab_size_zero_renders_nothing() {
     let b_x = glyph_xs(&layout, 0)[1];
     nearly_eq(b_x, a);
     nearly_eq(layout.width(), advance(&mut env, "ab"));
+
+    // The tab is still a cluster, so it keeps its letter-spacing gap: "b" follows the gaps after
+    // both "a" and the tab.
+    let text = "a\tb";
+    let mut builder = env.ranged_builder(text);
+    builder.push_default(StyleProperty::TabSize(TabSize::Spaces(0.)));
+    builder.push_default(StyleProperty::LetterSpacing(2.));
+    let mut layout = builder.build(text);
+    layout.break_all_lines(None);
+    nearly_eq(glyph_xs(&layout, 0)[1], a + 2. + 2.);
 }
 
 #[test]

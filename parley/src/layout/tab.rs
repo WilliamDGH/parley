@@ -1,7 +1,7 @@
 // Copyright 2026 the Parley Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Tab stops, following [CSS Text 4 § 4.1.3][css-tab-stop].
+//! Tab stops, following [CSS Text 4][css-tab-stop].
 //!
 //! A tab shapes to no glyphs, with the advance of a space. Its advance depends on where it lands
 //! on the line, so the line breaker sizes each tab as it places it, by overwriting the tab
@@ -25,7 +25,8 @@ use parley_engine::shape::Whitespace;
 ///
 /// The tab shifts to the next tab stop, or to the one after it if the next is less than half a
 /// space away so that a tab is always visible. CSS phrases that threshold as `0.5ch`; like Blink,
-/// we use half the space advance. A tab size that isn't positive renders the tab as nothing.
+/// we use half the space advance. A tab size that isn't positive gives the tab no advance of its
+/// own (spacing gaps still apply).
 pub(crate) fn tab_advance(x: f32, tab_size: TabSize, space_advance: f32, spacing: Spacing) -> f32 {
     let base = match tab_size {
         TabSize::Spaces(spaces) => spaces * (space_advance + spacing.letter + spacing.word),
