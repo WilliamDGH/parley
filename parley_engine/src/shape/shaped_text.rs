@@ -533,26 +533,33 @@ fn process_shaped_clusters<'a>(
         shaped_clusters: &mut Vec<ShapedCluster>,
     ) {
         let first_character = &characters[cluster.characters_start];
-        let is_newline = first_character.whitespace == Whitespace::Newline;
+        // Newlines and tabs render as no glyphs: a newline ends the line, and a tab's advance is
+        // the distance to the next tab stop, which depends on where the tab lands on a line, so a
+        // layout engine computes it when placing the tab (see `Whitespace::Tab`).
+        let is_glyphless_control = matches!(
+            first_character.whitespace,
+            Whitespace::Newline | Whitespace::Tab
+        );
         let is_inline_object = first_character.flags.is_inline_object();
         debug_assert!(
             !is_inline_object || char_end - cluster.characters_start == 1,
             "an inline object must be a cluster of its own"
         );
-        let (glyph_offset, glyph_len, inline_glyph, advance) = if is_newline || is_inline_object {
-            // Elide glyphs and advances of newlines and inline objects. Note that inline objects'
-            // advances can be set later by the user.
-            (cluster.glyphs_start as u32, 0, false, 0.)
-        } else if let Some(inline_glyph) = cluster.inline_glyph.take() {
-            (inline_glyph.id, 1, true, cluster.advance)
-        } else {
-            (
-                cluster.glyphs_start as u32,
-                cluster.glyphs as u8,
-                false,
-                cluster.advance,
-            )
-        };
+        let (glyph_offset, glyph_len, inline_glyph, advance) =
+            if is_glyphless_control || is_inline_object {
+                // Elide glyphs and advances of newlines, tabs and inline objects. Note that inline
+                // objects' advances can be set later by the user.
+                (cluster.glyphs_start as u32, 0, false, 0.)
+            } else if let Some(inline_glyph) = cluster.inline_glyph.take() {
+                (inline_glyph.id, 1, true, cluster.advance)
+            } else {
+                (
+                    cluster.glyphs_start as u32,
+                    cluster.glyphs as u8,
+                    false,
+                    cluster.advance,
+                )
+            };
 
         shaped_clusters.push(ShapedCluster {
             chars_range: (cluster.characters_start as u32, char_end as u32),
@@ -649,7 +656,7 @@ mod tests {
         shape::CharCluster,
     };
 
-    use super::ShapedText;
+    use super::{ShapedText, Whitespace};
 
     const ROBOTO: &[u8] =
         include_bytes!("../../../parley_dev/assets/fonts/roboto_fonts/Roboto-Regular.ttf");
@@ -857,6 +864,23 @@ mod tests {
             let newline_cluster = &shaped.shaped_clusters[index];
             assert_eq!(newline_cluster.glyph_len(), 0, "newline glyphs are removed");
             assert_eq!(newline_cluster.advance, 0., "newline advance is set to 0");
+        }
+    }
+
+    /// Tabs shape to no glyphs and no advance, like newlines. The distance to the next tab stop
+    /// depends on where the tab lands on a line, so a layout engine adds it when placing the tab.
+    #[test]
+    fn tabs_shape_to_no_glyphs_and_zero_advance() {
+        for font in [ROBOTO, NOTO_COLOR_EMOJI] {
+            let shaped = shape_with_font("a\tb", font);
+            let tab_cluster = shaped
+                .shaped_clusters()
+                .iter()
+                .find(|cluster| cluster.chars_range().start == 1)
+                .unwrap();
+            assert_eq!(tab_cluster.whitespace(), Whitespace::Tab);
+            assert_eq!(tab_cluster.glyph_len(), 0, "tab glyphs are removed");
+            assert_eq!(tab_cluster.advance, 0., "tab advance is set to 0");
         }
     }
 
