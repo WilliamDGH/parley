@@ -4,6 +4,7 @@
 use crate::inline_box::LayoutInlineBox;
 use crate::layout::spacing::{Justification, Spacing};
 use crate::layout::style_metrics::{BoxMetrics, StyleMetrics, inline_box_placement};
+use crate::layout::tab::tab_advance;
 use crate::layout::whitespace::whitespace_hangs;
 use crate::layout::{ContentWidths, LineMetrics, Style};
 use crate::resolve::ResolvedStyle;
@@ -455,10 +456,15 @@ struct ContentWidthsMeasurer {
     /// box is not included in the layout.
     line_has_content: bool,
 
-    /// The running advance of whitespace that would hang if a line ended here. Can exceed
-    /// `running_min_width` when the hanging whitespace started before the last break
-    /// opportunity, in which case the line consists entirely of hanging whitespace.
-    running_hanging_whitespace: f32,
+    /// The running advance of whitespace that would hang if a line ended here, under the
+    /// min-content constraint. Can exceed `running_min_width` when the hanging whitespace started
+    /// before the last break opportunity, in which case the line consists entirely of hanging
+    /// whitespace.
+    running_min_hanging: f32,
+
+    /// The same under the max-content constraint. The two differ when the whitespace includes a
+    /// tab, as a tab's advance depends on its position on the line.
+    running_max_hanging: f32,
 
     /// Whether that running whitespace hangs conditionally before a forced break (following CSS
     /// Text 4 § 4.3.2, that's the case for `WhiteSpaceCollapse::Preserve`). Conditionally hanging
@@ -482,7 +488,8 @@ impl ContentWidthsMeasurer {
             max_width: 0.,
             running_min_width: first_line_indent,
             running_max_width: first_line_indent,
-            running_hanging_whitespace: 0.,
+            running_min_hanging: 0.,
+            running_max_hanging: 0.,
             hangs_conditionally: false,
             text_wrap_mode: TextWrapMode::Wrap,
             soft_indent: indent_options.indent_following_soft_wrap_break(indent_amount),
@@ -504,7 +511,7 @@ impl ContentWidthsMeasurer {
         }
         self.min_width = self
             .min_width
-            .max(self.running_min_width - self.running_hanging_whitespace);
+            .max(self.running_min_width - self.running_min_hanging);
         self.running_min_width = self.soft_indent;
     }
 
@@ -518,12 +525,13 @@ impl ContentWidthsMeasurer {
     fn hard_break(&mut self) {
         self.min_width = self
             .min_width
-            .max(self.running_min_width - self.running_hanging_whitespace);
+            .max(self.running_min_width - self.running_min_hanging);
         if !self.hangs_conditionally {
-            self.running_max_width -= self.running_hanging_whitespace;
+            self.running_max_width -= self.running_max_hanging;
         }
         self.max_width = self.max_width.max(self.running_max_width);
-        self.running_hanging_whitespace = 0.0;
+        self.running_min_hanging = 0.0;
+        self.running_max_hanging = 0.0;
         self.line_has_content = false;
         self.running_min_width = self.hard_indent;
         self.running_max_width = self.hard_indent;
@@ -594,6 +602,11 @@ impl ContentWidthsMeasurer {
     /// With `SPACED`, each atom's spacing gap is added to the cluster on its visual end, i.e., its
     /// logically last cluster for LTR and its logically first cluster for RTL. The gap then hangs
     /// with that cluster, as in `atom_hanging_advance`. Without `SPACED`, `spacing` is ignored.
+    ///
+    /// A tab's advance depends on where it lands (see [`tab_advance`]), so it is computed from the
+    /// running width of each constraint, as the line breaker computes it from the line's running
+    /// advance; the tab's shaped advance is zero. The tab's advance under the two constraints
+    /// differs, so the hanging whitespace is tracked per constraint as well.
     #[inline(always)]
     fn measure_text_run<B: Brush, const SPACED: bool>(
         &mut self,
@@ -643,7 +656,14 @@ impl ContentWidthsMeasurer {
                 continue;
             }
 
-            let mut advance = cluster.advance;
+            let (mut min_advance, mut max_advance) = if whitespace == Whitespace::Tab {
+                (
+                    tab_advance(self.running_min_width, style.tab_size),
+                    tab_advance(self.running_max_width, style.tab_size),
+                )
+            } else {
+                (cluster.advance, cluster.advance)
+            };
             if SPACED {
                 let owns_gap = if is_rtl {
                     is_atom_start
@@ -653,11 +673,12 @@ impl ContentWidthsMeasurer {
                         .is_none_or(|next| next.is_grapheme_start())
                 };
                 if owns_gap {
-                    advance += gap;
+                    min_advance += gap;
+                    max_advance += gap;
                 }
             }
-            self.running_min_width += advance;
-            self.running_max_width += advance;
+            self.running_min_width += min_advance;
+            self.running_max_width += max_advance;
 
             // A cluster hangs if all of its characters hang. Its first character is checked via the
             // cached flags so the common case never touches `characters`.
@@ -674,11 +695,13 @@ impl ContentWidthsMeasurer {
                             )
                         }));
             if hangs {
-                self.running_hanging_whitespace += advance;
+                self.running_min_hanging += min_advance;
+                self.running_max_hanging += max_advance;
                 self.hangs_conditionally =
                     style.white_space_collapse == WhiteSpaceCollapse::Preserve;
             } else {
-                self.running_hanging_whitespace = 0.0;
+                self.running_min_hanging = 0.0;
+                self.running_max_hanging = 0.0;
             }
         }
         self.line_has_content = empty_at != clusters.len();
