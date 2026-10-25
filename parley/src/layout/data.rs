@@ -97,6 +97,23 @@ pub(crate) struct LineData {
     /// Empty for lines with only baseline-relative content because the root aligned subtree
     /// for each line trivially has an offset of 0
     pub(crate) aligned_subtree_offsets: Range<u32>,
+    /// This line's entries in [`LayoutData::tab_advances`]. Empty for lines without tabs.
+    pub(crate) tab_advances: Range<u32>,
+}
+
+/// The advance of a tab on a line, computed by the line breaker when it placed the tab.
+///
+/// A tab's advance is the distance from where it lands to the next tab stop (see
+/// [`tab_advance`]), so it depends on the line breaking. It is
+/// stored here rather than in the shaped text, whose advances are independent of layout, and is
+/// added to the tab's (zero) shaped advance on read, like justification; see
+/// [`EffectiveSpacing`](crate::layout::spacing::EffectiveSpacing).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TabAdvance {
+    /// The tab's shaped cluster, as an index into [`ShapedText::shaped_clusters`].
+    pub(crate) cluster: u32,
+    /// The distance from where the tab starts to its tab stop.
+    pub(crate) advance: f32,
 }
 
 /// Position of an [independent aligned subtree] rooted at a span with
@@ -218,6 +235,10 @@ pub(crate) struct LayoutData<B: Brush> {
     ///
     /// Each line owns a contiguous slice ([`LineData::aligned_subtree_offsets`]).
     pub(crate) aligned_subtree_offsets: Vec<AlignedSubtreeOffset>,
+    /// The advance of each tab in the layout, in logical order (and so sorted by cluster index).
+    ///
+    /// Each line owns a contiguous slice ([`LineData::tab_advances`]).
+    pub(crate) tab_advances: Vec<TabAdvance>,
     /// The width constraint that was used to line break the layout
     pub(crate) layout_max_advance: f32,
     /// The computed width of the layout excluding hanging whitespace
@@ -255,6 +276,7 @@ impl<B: Brush> Default for LayoutData<B> {
             lines: Vec::new(),
             line_items: Vec::new(),
             aligned_subtree_offsets: Vec::new(),
+            tab_advances: Vec::new(),
             alignment: None,
             layout_max_advance: 0.0,
             indent_amount: 0.0,
@@ -284,6 +306,7 @@ impl<B: Brush> LayoutData<B> {
         self.lines.clear();
         self.line_items.clear();
         self.aligned_subtree_offsets.clear();
+        self.tab_advances.clear();
         self.alignment = None;
     }
 
