@@ -277,6 +277,22 @@ pub enum StyleProperty<'a, B: Brush> {
     TextWrapMode(TextWrapMode),
     /// Whitespace collapsing and hanging behavior.
     WhiteSpaceCollapse(WhiteSpaceCollapse),
+    /// The distance between tab stops, in layout units, following [CSS `tab-size`][tab-size].
+    ///
+    /// A preserved tab advances to the next tab stop. Tab stops sit at multiples of the tab size
+    /// from the line's start edge, including any text indent. If the next stop is less than a
+    /// sixteenth of the tab size away, the tab advances to the stop after it instead, so that a
+    /// tab is always visible. (CSS phrases that threshold as half a space; at the CSS default of
+    /// eight spaces per tab stop the two agree.) A tab gets no letter or word spacing of its own,
+    /// so the text after it lands exactly on the stop. A tab size that isn't positive gives tabs
+    /// no advance at all.
+    ///
+    /// The CSS initial value is eight spaces of the block container's font. Parley can't measure
+    /// that yet, so the default is `0.0`: tabs take no space until a tab size is set, e.g. eight
+    /// times the advance of a space in the root style's font.
+    ///
+    /// [tab-size]: https://www.w3.org/TR/css-text-4/#tab-size-property
+    TabSize(f32),
 }
 
 /// Unresolved styles.
@@ -334,6 +350,8 @@ pub struct TextStyle<'family, 'settings, B: Brush> {
     pub text_wrap_mode: TextWrapMode,
     /// Whitespace collapsing and hanging behavior.
     pub white_space_collapse: WhiteSpaceCollapse,
+    /// The distance between tab stops, in layout units. See [`StyleProperty::TabSize`].
+    pub tab_size: f32,
 }
 
 impl<B: Brush> Default for TextStyle<'static, 'static, B> {
@@ -365,6 +383,7 @@ impl<B: Brush> Default for TextStyle<'static, 'static, B> {
             overflow_wrap: OverflowWrap::default(),
             text_wrap_mode: TextWrapMode::default(),
             white_space_collapse: WhiteSpaceCollapse::default(),
+            tab_size: 0.0,
         }
     }
 }
