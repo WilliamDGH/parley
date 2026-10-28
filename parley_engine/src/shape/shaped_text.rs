@@ -891,12 +891,16 @@ mod tests {
                     let after = u32::try_from(1 + control.chars().count()).unwrap();
                     // The character after the control starts a grapheme of its own.
                     assert!(shaped.characters[after as usize].grapheme_start, "{text:?}");
-                    // The control's clusters (two for CRLF) have no glyphs and no advance.
-                    for cluster in shaped
+                    // Each character of the control starts a cluster of its own (CR and LF each
+                    // do), and none of them has glyphs or an advance.
+                    let controls: Vec<_> = shaped
                         .shaped_clusters
                         .iter()
                         .filter(|cluster| (1..after).contains(&cluster.chars_range().start))
-                    {
+                        .collect();
+                    assert_eq!(controls.len(), (after - 1) as usize, "{text:?}");
+                    assert_eq!(controls[0].chars_range().start, 1, "{text:?}");
+                    for cluster in controls {
                         assert_eq!(cluster.glyph_len(), 0, "{text:?}");
                         assert_eq!(cluster.advance, 0., "{text:?}");
                     }
