@@ -213,8 +213,7 @@ impl<'a> EffectiveSpacing<'a> {
     /// entry for it.
     #[inline]
     fn tab_advance(&self, cluster: u32) -> f32 {
-        // The slice is sorted by cluster. A binary search is as quick as a linear scan for one tab
-        // and quicker from two tabs on.
+        // The slice is sorted by cluster.
         self.tab_advances
             .binary_search_by_key(&cluster, |tab| tab.cluster)
             .map_or(0., |index| self.tab_advances[index].advance)
