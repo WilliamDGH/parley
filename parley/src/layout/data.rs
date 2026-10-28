@@ -652,7 +652,7 @@ impl ContentWidthsMeasurer {
                 continue;
             }
 
-            let (mut skip_threshold, mut max_advance) = if whitespace == Whitespace::Tab {
+            let (mut min_advance, mut max_advance) = if whitespace == Whitespace::Tab {
                 (
                     tab_advance(
                         self.running_min_width,
@@ -677,11 +677,11 @@ impl ContentWidthsMeasurer {
                         .is_none_or(|next| next.is_grapheme_start())
                 };
                 if owns_gap {
-                    skip_threshold += gap;
+                    min_advance += gap;
                     max_advance += gap;
                 }
             }
-            self.running_min_width += skip_threshold;
+            self.running_min_width += min_advance;
             self.running_max_width += max_advance;
 
             // A cluster hangs if all of its characters hang. Its first character is checked via the
@@ -699,7 +699,7 @@ impl ContentWidthsMeasurer {
                             )
                         }));
             if hangs {
-                self.running_min_hanging += skip_threshold;
+                self.running_min_hanging += min_advance;
                 self.running_max_hanging += max_advance;
                 self.hangs_conditionally =
                     style.white_space_collapse == WhiteSpaceCollapse::Preserve;
