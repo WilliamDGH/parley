@@ -829,17 +829,30 @@ fn last_line_alignment() {
 
 #[test]
 /// On overflow without alignment-on-overflow, RTL-text should be start-aligned (i.e., aligned to
-/// the right edge, overflowing on the left).
+/// the right edge, overflowing on the left). Justified text is too (even with
+/// alignment-on-overflow, because it can't shrink the line).
 fn overflow_alignment_rtl() {
     let mut env = TestEnv::new(test_name!(), None);
 
-    let text = "عند برمجة أجهزة الكمبيوتر، قد تجد نفسك فجأة في مواقف غريبة، مثل الكتابة بلغة لا تتحدثها فعليًا.";
-    let builder = env.ranged_builder(text);
-    let mut layout = builder.build(text);
-    layout.break_all_lines(Some(1000.0));
-    layout.align(Alignment::Center, AlignmentOptions::default());
-    env.rendering_config().size = Some(Size::new(10., layout.height().into()));
-    env.check_layout_snapshot(&layout);
+    // The NBSP in the text below produces a line that slightly overflows, and gives that line a
+    // justification opportunity whose spacing should remain at 0 (because the line overflows).
+    let text = "عند برمجة أجهزة\u{A0}الكمبيوتر، قد تجد نفسك فجأة في مواقف غريبة، مثل الكتابة بلغة لا تتحدثها فعليًا.";
+    for (alignment, align_when_overflowing, test_case_name) in [
+        (Alignment::Center, false, "center"),
+        (Alignment::Justify, true, "justify_align_when_overflowing"),
+    ] {
+        let builder = env.ranged_builder(text);
+        let mut layout = builder.build(text);
+        layout.break_all_lines(Some(100.0));
+        layout.align(
+            alignment,
+            AlignmentOptions {
+                align_when_overflowing,
+                ..AlignmentOptions::default()
+            },
+        );
+        env.with_name(test_case_name).check_layout_snapshot(&layout);
+    }
 }
 
 #[test]
@@ -1138,7 +1151,7 @@ fn realign_all() {
                 ..AlignmentOptions::default()
             },
             "none",
-            "awo_true",
+            "align_when_overflowing_true",
         ),
         (
             None,
@@ -1147,7 +1160,7 @@ fn realign_all() {
                 ..AlignmentOptions::default()
             },
             "none",
-            "awo_false",
+            "align_when_overflowing_false",
         ),
     ];
 
@@ -1211,6 +1224,55 @@ fn realign_all() {
 fn layout_impl_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Layout<()>>();
+}
+
+/// Guards against the glyph run iterator misplacing an inline box's spacing gap, or the glyphs
+/// after it, with and without a tab before the box (the box and the tab are both atoms without
+/// glyphs). Source: CSS letter spacing is applied after the box, so the next glyph starts at the
+/// box's right edge plus the spacing.
+#[test]
+fn inline_box_spacing_moves_the_following_glyphs() {
+    let mut env = TestEnv::new(test_name!(), None);
+    for text in ["a\u{fffc}b", "a\t\u{fffc}b"] {
+        for spacing in [0., 3.] {
+            let mut builder = env.ranged_builder(text);
+            builder.push_default(StyleProperty::LetterSpacing(spacing));
+            builder.push_inline_box(InlineBox {
+                id: 0,
+                kind: InlineBoxKind::InFlow,
+                index: text.find('\u{fffc}').unwrap(),
+                width: 20.,
+                height: 10.,
+                baseline: None,
+                vertical_align: VerticalAlign::BASELINE,
+            });
+            let mut layout = builder.build(text);
+            layout.break_all_lines(None);
+            let line = layout.get(0).unwrap();
+            let items: Vec<_> = line.items().collect();
+            let box_x = items
+                .iter()
+                .find_map(|item| match item {
+                    PositionedLayoutItem::InlineBox(inline_box) => Some(inline_box.x),
+                    PositionedLayoutItem::GlyphRun(_) => None,
+                })
+                .unwrap();
+            let b_x = items
+                .iter()
+                .filter_map(|item| match item {
+                    PositionedLayoutItem::GlyphRun(run) => Some(run.positioned_glyphs()),
+                    PositionedLayoutItem::InlineBox(_) => None,
+                })
+                .flatten()
+                .last()
+                .unwrap()
+                .x;
+            assert!(
+                (b_x - (box_x + 20. + spacing)).abs() < 1e-3,
+                "{text:?}, spacing {spacing}: box at {box_x}, b at {b_x}"
+            );
+        }
+    }
 }
 
 #[test]
